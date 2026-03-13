@@ -7,7 +7,7 @@ Purpose
 -------
 Identify queries that contribute the highest memory grant pressure during
 a sampling window.
-
+ 
 This procedure is designed to remain useful even in environments with severe
 plan cache bloat by sampling active memory grants and active requests instead
 of relying primarily on plan cache metadata.
