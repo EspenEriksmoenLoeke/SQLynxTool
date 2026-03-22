@@ -1,219 +1,291 @@
-/*
-SQLynx Toolkit
-Procedure : sp_LynxTopQueryMemoryLoad
-Author    : Espen Eriksmoen Løke (SQLynx)
-
-Purpose
--------
-Identify queries that contribute the highest memory grant pressure during
-a sampling window.
- 
-This procedure is designed to remain useful even in environments with severe
-plan cache bloat by sampling active memory grants and active requests instead
-of relying primarily on plan cache metadata.
-
-Recommended installation location
----------------------------------
-master database
-
-Installing this procedure in master allows it to be executed from any
-database using:
-
-    EXEC sp_LynxTopQueryMemoryLoad
-
-Required permissions
---------------------
-VIEW SERVER STATE
-
-Example:
-
-    GRANT VIEW SERVER STATE TO [login];
-
-Notes
------
-1. This procedure samples active memory grants.
-2. Results represent observations during the sampling window.
-3. Statement text and plans are captured from active requests when available.
-*/
-
-
 CREATE OR ALTER PROCEDURE dbo.sp_LynxTopQueryMemoryLoad
 (
-    @Top               INT = 50,
-    @SampleTimeSeconds INT = 20,
+    @Top               INT = 10,
+    @SampleTimeSeconds INT = 30,
     @SampleIntervalMs  INT = 100
 )
 AS
 BEGIN
-
     SET NOCOUNT ON;
 
-    -------------------------------------------------------------------------
+    /************************************************************************************************************
+    Author:        Espen Eriksmoen Løke
+    Company:       SQLynx AS (Norway)
+    Website:       https://sqlynx.no
+    Toolkit:       https://sqlynx.no/sqlynx-performance-kit/
+
+    Procedure:     dbo.sp_LynxTopQueryMemoryLoad
+    Version:       1.0.0
+    Release date:  2026-03-22
+
+    Purpose:
+        Samples sys.dm_exec_query_memory_grants over a configurable time window and identifies
+        the top queries based on:
+
+            1. Total granted memory load (MB over time)
+            2. Total unused memory (wasted grant)
+            3. Maximum single memory grant
+
+        Designed for SQL Server performance tuning, specifically memory grant analysis.
+
+    Usage:
+        EXEC dbo.sp_LynxTopQueryMemoryLoad
+            @Top = 10,
+            @SampleTimeSeconds = 30,
+            @SampleIntervalMs = 100;
+
+    Output:
+        Returns 3 result sets:
+
+            1. Top queries by granted memory load
+            2. Top queries by unused memory load
+            3. Top queries by max granted memory
+
+        Each result includes:
+            - Query hash / plan hash
+            - Aggregated memory metrics
+            - Sample counts
+            - Database and object name
+            - Statement text and batch text
+            - Query plan (XML), when available
+
+    Notes:
+        - Tuning-focused: only rows with query_hash and query_plan_hash are ranked.
+        - Sampling-based approach: results reflect observed activity during the sample window.
+        - Very short-lived queries may be underrepresented.
+        - Memory grants without an active request row are sampled, but not included in the ranked output.
+        - #BestSample is selected to maximize the chance of returning an actual query plan.
+
+    Requirements:
+        Requires VIEW SERVER STATE permission.
+
+            GRANT VIEW SERVER STATE TO [login];
+
+        Needed for:
+            - sys.dm_exec_query_memory_grants
+            - sys.dm_exec_requests
+            - sys.dm_exec_sql_text
+            - sys.dm_exec_text_query_plan
+
+    Disclaimer:
+        Provided as-is by SQLynx AS. Use at your own risk. Test before production use.
+
+    ************************************************************************************************************/
+
+    ---------------------------------------------------------------------
     -- Defensive parameter handling
-    -------------------------------------------------------------------------
+    ---------------------------------------------------------------------
 
-    IF @Top IS NULL OR @Top < 1
-        SET @Top = 50;
+    IF @Top < 1 SET @Top = 10;
+    IF @SampleTimeSeconds < 1 SET @SampleTimeSeconds = 30;
+    IF @SampleIntervalMs < 50 SET @SampleIntervalMs = 50;
 
-    IF @SampleTimeSeconds IS NULL OR @SampleTimeSeconds < 1
-        SET @SampleTimeSeconds = 30;
-
-    IF @SampleIntervalMs IS NULL OR @SampleIntervalMs < 100
-        SET @SampleIntervalMs = 1000;
-
-    -------------------------------------------------------------------------
-    -- Temp table storing sampled grants
-    -------------------------------------------------------------------------
-
+    ---------------------------------------------------------------------
+    -- Temp table for raw samples
+    ---------------------------------------------------------------------
     CREATE TABLE #QueryExecutionGrantedMemory
     (
-        sample_time            datetime2(7)  NOT NULL,
-        session_id             int           NOT NULL,
-        request_id             int           NOT NULL,
-        database_id            smallint      NULL,
-        used_memory_kb         bigint        NULL,
-        granted_memory_kb      bigint        NULL,
-        required_memory_kb     bigint        NULL,
-        ideal_memory_kb        bigint        NULL,
-        query_hash             binary(8)     NULL,
-        query_plan_hash        binary(8)     NULL,
-        sql_handle             varbinary(64) NULL,
-        plan_handle            varbinary(64) NULL,
-        statement_start_offset int           NULL,
-        statement_end_offset   int           NULL
+        sample_time            DATETIME2(7)  NOT NULL,
+        database_id            SMALLINT      NULL,
+        query_hash             BINARY(8)     NULL,
+        query_plan_hash        BINARY(8)     NULL,
+        sql_handle             VARBINARY(64) NULL,
+        plan_handle            VARBINARY(64) NULL,
+        statement_start_offset INT           NULL,
+        statement_end_offset   INT           NULL,
+        granted_memory_kb      BIGINT        NOT NULL,
+        used_memory_kb         BIGINT        NULL,
+        unused_memory_kb       BIGINT        NOT NULL
     );
 
-    CREATE CLUSTERED INDEX IX_QEGM
-        ON #QueryExecutionGrantedMemory (sample_time, session_id, request_id);
+    CREATE CLUSTERED INDEX IX_QEGM_SampleTime
+        ON #QueryExecutionGrantedMemory(sample_time);
 
-    -------------------------------------------------------------------------
-    -- Sampling loop configuration
-    -------------------------------------------------------------------------
+    CREATE INDEX IX_QEGM_Query
+        ON #QueryExecutionGrantedMemory(query_hash, query_plan_hash);
 
+    ---------------------------------------------------------------------
+    -- Sampling configuration
+    ---------------------------------------------------------------------
     DECLARE
-        @EndTime datetime2(7) = DATEADD(SECOND, @SampleTimeSeconds, SYSUTCDATETIME()),
-        @Delay   varchar(16);
+        @EndTime DATETIME2(7) = DATEADD(SECOND, @SampleTimeSeconds, SYSUTCDATETIME()),
+        @Delay   VARCHAR(16);
 
     SET @Delay =
         '00:00:' +
-        RIGHT('00' + CAST(@SampleIntervalMs / 1000 AS varchar(2)),2) +
+        RIGHT('00' + CAST(@SampleIntervalMs / 1000 AS VARCHAR(2)), 2) +
         '.' +
-        RIGHT('000' + CAST(@SampleIntervalMs % 1000 AS varchar(3)),3);
+        RIGHT('000' + CAST(@SampleIntervalMs % 1000 AS VARCHAR(3)), 3);
 
-    -------------------------------------------------------------------------
+    ---------------------------------------------------------------------
     -- Sampling loop
-    -------------------------------------------------------------------------
-
+    ---------------------------------------------------------------------
     WHILE SYSUTCDATETIME() < @EndTime
     BEGIN
-
         INSERT #QueryExecutionGrantedMemory
         (
             sample_time,
-            session_id,
-            request_id,
             database_id,
-            used_memory_kb,
-            granted_memory_kb,
-            required_memory_kb,
-            ideal_memory_kb,
             query_hash,
             query_plan_hash,
             sql_handle,
             plan_handle,
             statement_start_offset,
-            statement_end_offset
+            statement_end_offset,
+            granted_memory_kb,
+            used_memory_kb,
+            unused_memory_kb
         )
         SELECT
             SYSUTCDATETIME(),
-            mg.session_id,
-            mg.request_id,
             r.database_id,
-            mg.used_memory_kb,
-            mg.granted_memory_kb,
-            mg.required_memory_kb,
-            mg.ideal_memory_kb,
-            mg.query_hash,
-            mg.query_plan_hash,
-            r.sql_handle,
-            r.plan_handle,
+            r.query_hash,
+            r.query_plan_hash,
+            COALESCE(r.sql_handle, mg.sql_handle),
+            COALESCE(r.plan_handle, mg.plan_handle),
             r.statement_start_offset,
-            r.statement_end_offset
-        FROM sys.dm_exec_query_memory_grants AS mg
-        LEFT JOIN sys.dm_exec_requests AS r
-            ON r.session_id = mg.session_id
-           AND r.request_id = mg.request_id
-        WHERE mg.query_hash IS NOT NULL
-          AND mg.query_plan_hash IS NOT NULL;
+            r.statement_end_offset,
+            mg.granted_memory_kb,
+            mg.used_memory_kb,
+            CASE
+                WHEN mg.granted_memory_kb > COALESCE(mg.used_memory_kb, 0)
+                    THEN mg.granted_memory_kb - COALESCE(mg.used_memory_kb, 0)
+                ELSE 
+                    0
+            END
+        FROM 
+            sys.dm_exec_query_memory_grants AS mg
+        LEFT JOIN 
+            sys.dm_exec_requests AS r ON (r.session_id = mg.session_id AND r.request_id = mg.request_id)
+        WHERE 
+            mg.granted_memory_kb > 0
+        AND 
+            mg.grant_time IS NOT NULL;
 
         WAITFOR DELAY @Delay;
-
     END;
 
-    DECLARE @TotalSampleMoments bigint;
-
+    ---------------------------------------------------------------------
+    -- Aggregated metrics for tunable queries only
+    ---------------------------------------------------------------------
     SELECT
-        @TotalSampleMoments = COUNT(DISTINCT sample_time)
-    FROM #QueryExecutionGrantedMemory;
+        q.query_hash,
+        q.query_plan_hash,
 
-    -------------------------------------------------------------------------
-    -- Queries causing highest total memory load
-    -------------------------------------------------------------------------
+        COUNT(*) AS SampleCount,
+        COUNT(DISTINCT q.sample_time) AS DistinctSampleMoments,
 
-    ;WITH MemoryLoad AS
+        SUM(q.granted_memory_kb) / 1024.0 AS GrantedMemoryLoadScoreMB,
+        AVG(q.granted_memory_kb) / 1024.0 AS AvgGrantedMemoryMB,
+        MAX(q.granted_memory_kb) / 1024.0 AS MaxGrantedMemoryMB,
+
+        SUM(COALESCE(q.used_memory_kb, 0)) / 1024.0 AS UsedMemoryLoadScoreMB,
+        AVG(COALESCE(q.used_memory_kb, 0)) / 1024.0 AS AvgUsedMemoryMB,
+        MAX(COALESCE(q.used_memory_kb, 0)) / 1024.0 AS MaxUsedMemoryMB,
+
+        SUM(q.unused_memory_kb) / 1024.0 AS UnusedMemoryLoadScoreMB,
+        AVG(q.unused_memory_kb) / 1024.0 AS AvgUnusedMemoryMB,
+        MAX(q.unused_memory_kb) / 1024.0 AS MaxUnusedMemoryMB
+    INTO 
+        #MemoryLoad
+    FROM 
+        #QueryExecutionGrantedMemory AS q
+    WHERE 
+        q.query_hash IS NOT NULL
+    AND 
+        q.query_plan_hash IS NOT NULL
+    GROUP BY
+        q.query_hash,
+        q.query_plan_hash;
+
+    CREATE CLUSTERED INDEX IX_MemoryLoad
+        ON #MemoryLoad(query_hash, query_plan_hash);
+
+    ---------------------------------------------------------------------
+    -- Best sample per query
+    -- Prioritizes rows where an actual query plan can be retrieved
+    ---------------------------------------------------------------------
+    SELECT
+        d.sample_time,
+        d.database_id,
+        d.query_hash,
+        d.query_plan_hash,
+        d.sql_handle,
+        d.plan_handle,
+        d.statement_start_offset,
+        d.statement_end_offset,
+        d.granted_memory_kb,
+        d.used_memory_kb,
+        d.unused_memory_kb
+    INTO 
+        #BestSample
+    FROM
     (
         SELECT
-            query_hash,
-            query_plan_hash,
-            COUNT(*) AS SampleCount,
-            COUNT(DISTINCT sample_time) AS DistinctSampleMoments,
-            SUM(granted_memory_kb) / 1024.0 AS MemoryLoadScoreMB,
-            SUM(used_memory_kb) / 1024.0 AS UsedMemoryLoadScoreMB,
-            AVG(granted_memory_kb) / 1024.0 AS AvgGrantedMemoryMB,
-            MAX(granted_memory_kb) / 1024.0 AS MaxGrantedMemoryMB,
-            AVG(used_memory_kb) / 1024.0 AS AvgUsedMemoryMB,
-            MAX(used_memory_kb) / 1024.0 AS MaxUsedMemoryMB
-        FROM #QueryExecutionGrantedMemory
-        GROUP BY
-            query_hash,
-            query_plan_hash
-    ),
-    BestSample AS
-    (
-        SELECT
-            *,
+            q.sample_time,
+            q.database_id,
+            q.query_hash,
+            q.query_plan_hash,
+            q.sql_handle,
+            q.plan_handle,
+            q.statement_start_offset,
+            q.statement_end_offset,
+            q.granted_memory_kb,
+            q.used_memory_kb,
+            q.unused_memory_kb,
             ROW_NUMBER() OVER
             (
-                PARTITION BY query_hash, query_plan_hash
-                ORDER BY granted_memory_kb DESC,
-                         used_memory_kb DESC,
-                         sample_time DESC
+                PARTITION BY q.query_hash, q.query_plan_hash
+                ORDER BY
+                    CASE WHEN qp.query_plan IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    CASE WHEN q.plan_handle IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    CASE WHEN q.sql_handle IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    q.sample_time DESC,
+                    q.granted_memory_kb DESC,
+                    COALESCE(q.used_memory_kb, 0) DESC                    
             ) AS rn
-        FROM #QueryExecutionGrantedMemory
-        WHERE sql_handle IS NOT NULL
-    )
+        FROM 
+            #QueryExecutionGrantedMemory AS q
+        OUTER APPLY 
+            sys.dm_exec_text_query_plan
+            (
+                q.plan_handle,
+                q.statement_start_offset,
+                q.statement_end_offset
+            ) AS qp
+        WHERE 
+            q.query_hash IS NOT NULL
+        AND 
+            q.query_plan_hash IS NOT NULL
+        AND 
+            (q.sql_handle IS NOT NULL OR q.plan_handle IS NOT NULL)
+    ) AS d
+    WHERE 
+        d.rn = 1;
 
-    SELECT TOP (@Top)
+    CREATE CLUSTERED INDEX IX_BestSample
+        ON #BestSample(query_hash, query_plan_hash);
 
-        MetricName = 'Top queries by memory load',
+    ---------------------------------------------------------------------
+    -- Final reusable result set
+    ---------------------------------------------------------------------
 
-        SampleWindowSeconds  = @SampleTimeSeconds,
-        SampleIntervalMs     = @SampleIntervalMs,
-        TotalSampleMoments   = @TotalSampleMoments,
-
+    SELECT
         ml.query_hash,
         ml.query_plan_hash,
 
-        ml.MemoryLoadScoreMB,
-        MemoryLoadScoreMBSeconds = ml.MemoryLoadScoreMB * (@SampleIntervalMs / 1000.0),
-
+        ml.GrantedMemoryLoadScoreMB,
         ml.UsedMemoryLoadScoreMB,
-        UsedMemoryLoadScoreMBSeconds = ml.UsedMemoryLoadScoreMB * (@SampleIntervalMs / 1000.0),
+        ml.UnusedMemoryLoadScoreMB,
 
         ml.AvgGrantedMemoryMB,
         ml.MaxGrantedMemoryMB,
+
         ml.AvgUsedMemoryMB,
         ml.MaxUsedMemoryMB,
+
+        ml.AvgUnusedMemoryMB,
+        ml.MaxUnusedMemoryMB,
 
         ml.SampleCount,
         ml.DistinctSampleMoments,
@@ -229,30 +301,12 @@ BEGIN
                     + QUOTENAME(OBJECT_NAME(t.objectid, COALESCE(bs.database_id, t.dbid)))
             END,
 
-        statement_text = st.statement_text,
-
-        batch_text = t.text,
-
-        query_plan = qp.query_plan
-
-    FROM MemoryLoad ml
-
-    LEFT JOIN BestSample bs
-        ON bs.query_hash = ml.query_hash
-       AND bs.query_plan_hash = ml.query_plan_hash
-       AND bs.rn = 1
-
-    OUTER APPLY sys.dm_exec_sql_text(bs.sql_handle) t
-
-    OUTER APPLY
-    (
-        SELECT
-            statement_text =
-                CASE
-                    WHEN t.text IS NOT NULL
-                     AND bs.statement_start_offset IS NOT NULL
-                     AND bs.statement_end_offset IS NOT NULL
-                    THEN SUBSTRING
+        statement_text =
+            CASE
+                WHEN t.text IS NOT NULL
+                 AND bs.statement_start_offset IS NOT NULL
+                THEN
+                    SUBSTRING
                     (
                         t.text,
                         (bs.statement_start_offset / 2) + 1,
@@ -266,20 +320,67 @@ BEGIN
                             ) / 2
                         ) + 1
                     )
-                    ELSE t.text
-                END
-    ) st
+                ELSE t.text
+            END,
 
-    OUTER APPLY sys.dm_exec_text_query_plan
-    (
-        bs.plan_handle,
-        bs.statement_start_offset,
-        bs.statement_end_offset
-    ) qp
+        batch_text = t.text,
+        query_plan = qp.query_plan
+    INTO 
+        #Final
+    FROM 
+        #MemoryLoad AS ml
+    LEFT JOIN 
+        #BestSample AS bs ON (bs.query_hash = ml.query_hash AND bs.query_plan_hash = ml.query_plan_hash)
+    OUTER APPLY 
+        sys.dm_exec_sql_text(bs.sql_handle) AS t
+    OUTER APPLY 
+        sys.dm_exec_text_query_plan
+        (
+            bs.plan_handle,
+            bs.statement_start_offset,
+            bs.statement_end_offset
+        ) AS qp;
 
+    ---------------------------------------------------------------------
+    -- Result set 1: Top queries by granted memory load
+    ---------------------------------------------------------------------
+
+    SELECT TOP (@Top)
+        ResultSetName = 'Top queries by granted memory load',        
+        *
+    FROM 
+        #Final
     ORDER BY
-        ml.MemoryLoadScoreMB DESC,
-        ml.MaxGrantedMemoryMB DESC;
+        GrantedMemoryLoadScoreMB DESC,
+        UsedMemoryLoadScoreMB ASC,
+        MaxGrantedMemoryMB DESC
+        
 
+    ---------------------------------------------------------------------
+    -- Result set 2: Top queries by unused memory load
+    ---------------------------------------------------------------------
+    SELECT TOP (@Top)
+        ResultSetName = 'Top queries by unused memory load',
+        *
+    FROM 
+        #Final
+    ORDER BY
+        UnusedMemoryLoadScoreMB DESC,
+        GrantedMemoryLoadScoreMB DESC,
+        MaxGrantedMemoryMB DESC
+        
+    ---------------------------------------------------------------------
+    -- Result set 3: Top queries by max granted memory
+    ---------------------------------------------------------------------
+    SELECT TOP (@Top)
+        ResultSetName = 'Top queries by max granted memory',
+        *
+    FROM 
+        #Final
+    ORDER BY
+        MaxGrantedMemoryMB DESC,
+        GrantedMemoryLoadScoreMB DESC,
+        UnusedMemoryLoadScoreMB DESC
+    OPTION (RECOMPILE);
 END
 GO
