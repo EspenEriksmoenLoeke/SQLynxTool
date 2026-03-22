@@ -324,7 +324,7 @@ BEGIN
             END,
 
         batch_text = t.text,
-        query_plan = qp.query_plan
+        query_plan = CAST(qp.query_plan AS XML)
     INTO 
         #Final
     FROM 
