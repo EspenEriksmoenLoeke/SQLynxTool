@@ -1,4 +1,4 @@
-CREATE OR ALTER PROCEDURE dbo.sp_LynxTopQueryMemoryLoad
+CREATE OR ALTER PROCEDURE dbo.sp_LynxTopQueriesGrantedMemoryLoad
 (
     @Top               INT = 10,
     @SampleTimeSeconds INT = 30,
@@ -9,12 +9,12 @@ BEGIN
     SET NOCOUNT ON;
 
     /************************************************************************************************************
-    Author:        Espen Eriksmoen Løke
+    Author:        Espen Eriksmoen LÃ¸ke
     Company:       SQLynx AS (Norway)
     Website:       https://sqlynx.no
     Toolkit:       https://sqlynx.no/sqlynx-performance-kit/
 
-    Procedure:     dbo.sp_LynxTopQueryMemoryLoad
+    Procedure:     dbo.sp_LynxTopQueriesGrantedMemoryLoad
     Version:       1.0.0
     Release date:  2026-03-22
 
@@ -29,7 +29,7 @@ BEGIN
         Designed for SQL Server performance tuning, specifically memory grant analysis.
 
     Usage:
-        EXEC dbo.sp_LynxTopQueryMemoryLoad
+        EXEC dbo.sp_LynxTopQueriesGrantedMemoryLoad
             @Top = 10,
             @SampleTimeSeconds = 30,
             @SampleIntervalMs = 100;
